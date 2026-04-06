@@ -591,7 +591,8 @@ st.title("Comparateur de calendriers iCal")
 st.caption("Colle plusieurs liens iCal/webcal pour afficher les agendas côte à côte.")
 
 default_urls = """webcal://www.myefrei.fr/api/public/student/planning/pcWHs8Tg3umg1OXRgfqqQQ
-webcal://www.myefrei.fr/api/public/student/planning/cmcTf7nJ0SVSqKyQpsulqg"""
+webcal://www.myefrei.fr/api/public/student/planning/cmcTf7nJ0SVSqKyQpsulqg
+webcal://www.myefrei.fr/api/public/student/planning/JlM9Sr5ctIJgkWsL_78KsA"""
 
 urls_text = st.text_area(
     "Liens iCal / webcal (un par ligne)",
