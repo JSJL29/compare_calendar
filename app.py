@@ -4,18 +4,19 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Dict, List
 
 import pandas as pd
+import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from icalendar import Calendar
 
-st.set_page_config(page_title="Comparateur ICS - Vue agenda", layout="wide")
-
+st.set_page_config(page_title="Comparateur iCal", layout="wide")
 
 # ============================================================
 # CONFIG
 # ============================================================
 DISPLAY_TZ = "Europe/Paris"
-DAY_START_HOUR = 8
-DAY_END_HOUR = 21
+DEFAULT_DAY_START_HOUR = 8
+DEFAULT_DAY_END_HOUR = 21
 PIXELS_PER_HOUR = 90
 HEADER_HEIGHT = 46
 LEFT_TIME_COL_WIDTH = 70
@@ -23,7 +24,7 @@ MIN_EVENT_HEIGHT = 28
 
 
 # ============================================================
-# OUTILS
+# OUTILS GÉNÉRAUX
 # ============================================================
 def ensure_datetime(value: Any) -> datetime:
     if isinstance(value, datetime):
@@ -43,7 +44,52 @@ def safe_text(value: Any) -> str:
     return "" if value is None else str(value)
 
 
-def parse_ics_file(file_name: str, raw_bytes: bytes) -> pd.DataFrame:
+def format_day_fr(d: date) -> str:
+    jours = [
+        "Lundi", "Mardi", "Mercredi", "Jeudi",
+        "Vendredi", "Samedi", "Dimanche"
+    ]
+    mois = [
+        "", "janvier", "février", "mars", "avril", "mai", "juin",
+        "juillet", "août", "septembre", "octobre", "novembre", "décembre"
+    ]
+    return f"{jours[d.weekday()]} {d.day} {mois[d.month]} {d.year}"
+
+
+# ============================================================
+# GESTION DES URL iCAL / WEBCAL
+# ============================================================
+def webcal_to_http(url: str) -> str:
+    url = url.strip()
+    if url.startswith("webcal://"):
+        return "https://" + url[len("webcal://"):]
+    return url
+
+
+def download_ical_from_url(url: str) -> bytes:
+    final_url = webcal_to_http(url)
+    headers = {
+        "User-Agent": "Mozilla/5.0 ICS-Comparator/1.0"
+    }
+    response = requests.get(final_url, headers=headers, timeout=25)
+    response.raise_for_status()
+    return response.content
+
+
+def extract_name_from_url(url: str, index: int) -> str:
+    cleaned = url.strip()
+    cleaned = cleaned.replace("webcal://", "").replace("https://", "").replace("http://", "")
+    if not cleaned:
+        return f"Agenda {index}"
+
+    short = cleaned[:50]
+    return f"Agenda {index} - {short}"
+
+
+# ============================================================
+# PARSING ICS
+# ============================================================
+def parse_ics_file(calendar_name: str, raw_bytes: bytes) -> pd.DataFrame:
     cal = Calendar.from_ical(raw_bytes)
     rows: List[Dict[str, Any]] = []
 
@@ -69,7 +115,7 @@ def parse_ics_file(file_name: str, raw_bytes: bytes) -> pd.DataFrame:
 
         rows.append(
             {
-                "calendar": file_name,
+                "calendar": calendar_name,
                 "uid": safe_text(uid),
                 "title": safe_text(summary) or "(sans titre)",
                 "location": safe_text(location),
@@ -92,8 +138,9 @@ def parse_ics_file(file_name: str, raw_bytes: bytes) -> pd.DataFrame:
             ]
         )
 
-    df = pd.DataFrame(rows).sort_values(["start_utc", "end_utc", "title"]).reset_index(drop=True)
-    return df
+    return pd.DataFrame(rows).sort_values(
+        ["start_utc", "end_utc", "title"]
+    ).reset_index(drop=True)
 
 
 def enrich_local_columns(df: pd.DataFrame, tz_name: str = DISPLAY_TZ) -> pd.DataFrame:
@@ -109,9 +156,6 @@ def enrich_local_columns(df: pd.DataFrame, tz_name: str = DISPLAY_TZ) -> pd.Data
 
 
 def split_multi_day_events(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Coupe les événements multi-jours pour une vue journalière.
-    """
     if df.empty:
         return df.copy()
 
@@ -143,25 +187,74 @@ def split_multi_day_events(df: pd.DataFrame) -> pd.DataFrame:
 
             current_day += timedelta(days=1)
 
+    if not pieces:
+        return pd.DataFrame(columns=list(df.columns) + [
+            "day", "segment_start", "segment_end",
+            "segment_start_str", "segment_end_str", "duration_min"
+        ])
+
     return pd.DataFrame(pieces)
 
 
+# ============================================================
+# CONFLITS ET CHEVAUCHEMENTS
+# ============================================================
 def intervals_overlap(a_start: pd.Timestamp, a_end: pd.Timestamp, b_start: pd.Timestamp, b_end: pd.Timestamp) -> bool:
     return max(a_start, b_start) < min(a_end, b_end)
 
 
+def detect_cross_calendar_conflicts(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        out = df.copy()
+        out["has_conflict"] = False
+        out["conflict_with"] = ""
+        return out
+
+    out = df.copy().reset_index(drop=True)
+    out["has_conflict"] = False
+    out["conflict_with"] = ""
+
+    for day in sorted(out["day"].unique()):
+        day_df = out[out["day"] == day]
+
+        day_indices = list(day_df.index)
+        for i in range(len(day_indices)):
+            for j in range(i + 1, len(day_indices)):
+                ia = day_indices[i]
+                ib = day_indices[j]
+
+                a = out.loc[ia]
+                b = out.loc[ib]
+
+                if a["calendar"] == b["calendar"]:
+                    continue
+
+                if intervals_overlap(a["segment_start"], a["segment_end"], b["segment_start"], b["segment_end"]):
+                    out.loc[ia, "has_conflict"] = True
+                    out.loc[ib, "has_conflict"] = True
+
+                    a_conf = set(filter(None, str(out.loc[ia, "conflict_with"]).split(" | ")))
+                    b_conf = set(filter(None, str(out.loc[ib, "conflict_with"]).split(" | ")))
+
+                    a_conf.add(str(b["calendar"]))
+                    b_conf.add(str(a["calendar"]))
+
+                    out.loc[ia, "conflict_with"] = " | ".join(sorted(a_conf))
+                    out.loc[ib, "conflict_with"] = " | ".join(sorted(b_conf))
+
+    return out
+
+
 def assign_columns_for_overlaps(events: pd.DataFrame) -> pd.DataFrame:
-    """
-    Pour une colonne calendrier donnée et un jour donné :
-    calcule des sous-colonnes internes si des événements se chevauchent.
-    """
     if events.empty:
         out = events.copy()
         out["overlap_col"] = 0
         out["overlap_count"] = 1
         return out
 
-    events = events.sort_values(["segment_start", "segment_end", "title"]).reset_index(drop=True).copy()
+    events = events.sort_values(
+        ["segment_start", "segment_end", "title"]
+    ).reset_index(drop=True).copy()
 
     active = []
     overlap_col = []
@@ -188,70 +281,17 @@ def assign_columns_for_overlaps(events: pd.DataFrame) -> pd.DataFrame:
     return events
 
 
-def detect_cross_calendar_conflicts(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Détecte les conflits entre calendriers différents sur le même jour.
-    """
-    if df.empty:
-        out = df.copy()
-        out["has_conflict"] = False
-        out["conflict_with"] = ""
-        return out
-
-    out = df.copy().reset_index(drop=True)
-    out["has_conflict"] = False
-    out["conflict_with"] = ""
-
-    for day in sorted(out["day"].unique()):
-        day_df = out[out["day"] == day]
-
-        for i in day_df.index:
-            for j in day_df.index:
-                if j <= i:
-                    continue
-
-                a = out.loc[i]
-                b = out.loc[j]
-
-                if a["calendar"] == b["calendar"]:
-                    continue
-
-                if intervals_overlap(a["segment_start"], a["segment_end"], b["segment_start"], b["segment_end"]):
-                    out.loc[i, "has_conflict"] = True
-                    out.loc[j, "has_conflict"] = True
-
-                    a_conf = set(filter(None, str(out.loc[i, "conflict_with"]).split(" | ")))
-                    b_conf = set(filter(None, str(out.loc[j, "conflict_with"]).split(" | ")))
-                    a_conf.add(str(b["calendar"]))
-                    b_conf.add(str(a["calendar"]))
-                    out.loc[i, "conflict_with"] = " | ".join(sorted(a_conf))
-                    out.loc[j, "conflict_with"] = " | ".join(sorted(b_conf))
-
-    return out
-
-
-def format_day_fr(d: date) -> str:
-    jours = [
-        "Lundi", "Mardi", "Mercredi", "Jeudi",
-        "Vendredi", "Samedi", "Dimanche"
-    ]
-    mois = [
-        "", "janvier", "février", "mars", "avril", "mai", "juin",
-        "juillet", "août", "septembre", "octobre", "novembre", "décembre"
-    ]
-    return f"{jours[d.weekday()]} {d.day} {mois[d.month]} {d.year}"
-
-
-def day_bounds(day_value: date, tz_name: str = DISPLAY_TZ) -> tuple[pd.Timestamp, pd.Timestamp]:
-    tz = pd.Timestamp.now(tz=tz_name).tz
-    start = pd.Timestamp(datetime.combine(day_value, time.min), tz=tz)
-    end = start + pd.Timedelta(days=1)
-    return start, end
-
-
-def crop_event_to_visible_hours(start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> tuple[pd.Timestamp, pd.Timestamp] | None:
-    visible_start = start_dt.normalize() + pd.Timedelta(hours=DAY_START_HOUR)
-    visible_end = start_dt.normalize() + pd.Timedelta(hours=DAY_END_HOUR)
+# ============================================================
+# RENDU AGENDA HTML
+# ============================================================
+def crop_event_to_visible_hours(
+    start_dt: pd.Timestamp,
+    end_dt: pd.Timestamp,
+    day_start_hour: int,
+    day_end_hour: int,
+) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+    visible_start = start_dt.normalize() + pd.Timedelta(hours=day_start_hour)
+    visible_end = start_dt.normalize() + pd.Timedelta(hours=day_end_hour)
 
     cropped_start = max(start_dt, visible_start)
     cropped_end = min(end_dt, visible_end)
@@ -262,14 +302,21 @@ def crop_event_to_visible_hours(start_dt: pd.Timestamp, end_dt: pd.Timestamp) ->
     return cropped_start, cropped_end
 
 
-def event_to_style(start_dt: pd.Timestamp, end_dt: pd.Timestamp, overlap_col: int, overlap_count: int) -> dict:
-    visible = crop_event_to_visible_hours(start_dt, end_dt)
+def event_to_style(
+    start_dt: pd.Timestamp,
+    end_dt: pd.Timestamp,
+    overlap_col: int,
+    overlap_count: int,
+    day_start_hour: int,
+    day_end_hour: int,
+) -> dict:
+    visible = crop_event_to_visible_hours(start_dt, end_dt, day_start_hour, day_end_hour)
     if visible is None:
         return {}
 
     cropped_start, cropped_end = visible
 
-    total_minutes_from_top = (cropped_start.hour * 60 + cropped_start.minute) - DAY_START_HOUR * 60
+    total_minutes_from_top = (cropped_start.hour * 60 + cropped_start.minute) - day_start_hour * 60
     duration_minutes = (cropped_end - cropped_start).total_seconds() / 60
 
     top = total_minutes_from_top * PIXELS_PER_HOUR / 60
@@ -288,15 +335,31 @@ def event_to_style(start_dt: pd.Timestamp, end_dt: pd.Timestamp, overlap_col: in
     }
 
 
-def render_agenda_for_day(day_df: pd.DataFrame, calendars: List[str]) -> str:
-    total_height = (DAY_END_HOUR - DAY_START_HOUR) * PIXELS_PER_HOUR
-    hour_lines = list(range(DAY_START_HOUR, DAY_END_HOUR + 1))
+def render_agenda_for_day(
+    day_df: pd.DataFrame,
+    calendars: List[str],
+    day_start_hour: int,
+    day_end_hour: int,
+) -> str:
+    total_height = (day_end_hour - day_start_hour) * PIXELS_PER_HOUR
+    hour_lines = list(range(day_start_hour, day_end_hour + 1))
 
     html_parts = []
 
     html_parts.append(
         f"""
         <style>
+            * {{
+                box-sizing: border-box;
+            }}
+
+            body {{
+                margin: 0;
+                padding: 0;
+                font-family: Arial, sans-serif;
+                background: white;
+            }}
+
             .agenda-shell {{
                 width: 100%;
                 border: 1px solid #d9d9d9;
@@ -304,7 +367,6 @@ def render_agenda_for_day(day_df: pd.DataFrame, calendars: List[str]) -> str:
                 overflow: hidden;
                 background: #ffffff;
                 box-shadow: 0 2px 10px rgba(0,0,0,0.06);
-                margin-bottom: 22px;
             }}
 
             .agenda-header {{
@@ -426,26 +488,24 @@ def render_agenda_for_day(day_df: pd.DataFrame, calendars: List[str]) -> str:
     )
 
     html_parts.append('<div class="agenda-shell">')
-
     html_parts.append('<div class="agenda-header">')
     html_parts.append('<div class="agenda-header-time">Heure</div>')
+
     for cal in calendars:
         html_parts.append(f'<div class="agenda-header-cell">{cal}</div>')
-    html_parts.append("</div>")
 
+    html_parts.append("</div>")
     html_parts.append('<div class="agenda-body">')
 
-    # colonne heures
     html_parts.append('<div class="time-col">')
     for hour in hour_lines:
-        top = (hour - DAY_START_HOUR) * PIXELS_PER_HOUR
+        top = (hour - day_start_hour) * PIXELS_PER_HOUR
         if 0 <= top <= total_height:
             html_parts.append(
                 f'<div class="time-label" style="top:{top}px;">{hour:02d}:00</div>'
             )
     html_parts.append("</div>")
 
-    # colonnes agendas
     for cal in calendars:
         cal_df = day_df[day_df["calendar"] == cal].copy()
         cal_df = assign_columns_for_overlaps(cal_df)
@@ -458,6 +518,8 @@ def render_agenda_for_day(day_df: pd.DataFrame, calendars: List[str]) -> str:
                 event["segment_end"],
                 int(event["overlap_col"]),
                 int(event["overlap_count"]),
+                day_start_hour,
+                day_end_hour,
             )
 
             if not style:
@@ -476,13 +538,13 @@ def render_agenda_for_day(day_df: pd.DataFrame, calendars: List[str]) -> str:
             html_parts.append(
                 f"""
                 <div class="{css_class}"
-                     style="
+                    style="
                         top:{style['top']}px;
                         height:{style['height']}px;
                         left:calc({style['left_pct']}% + {style['inner_gap'] / 2}px);
                         width:calc({style['width_pct']}% - {style['inner_gap']}px);
-                     ">
-                    <div class="event-badge">Cours</div>
+                    ">
+                    <div class="event-badge">Événement</div>
                     <div class="event-title">{event["title"]}</div>
                     <div class="event-time">{event["segment_start_str"]} → {event["segment_end_str"]}</div>
                     {location_html}
@@ -500,45 +562,52 @@ def render_agenda_for_day(day_df: pd.DataFrame, calendars: List[str]) -> str:
 
 
 # ============================================================
-# CHARGEMENT
+# UI
 # ============================================================
-st.title("Comparateur de calendriers ICS")
-st.caption("Vue agenda journalière, avec plusieurs calendriers côte à côte.")
+st.title("Comparateur de calendriers iCal")
+st.caption("Colle plusieurs liens iCal/webcal pour afficher les agendas côte à côte.")
 
-uploaded_files = st.file_uploader(
-    "Ajoute 2 fichiers .ics ou plus",
-    type=["ics"],
-    accept_multiple_files=True,
+default_urls = """webcal://www.myefrei.fr/api/public/student/planning/pcWHs8Tg3umg1OXRgfqqQQ
+webcal://www.myefrei.fr/api/public/student/planning/cmcTf7nJ0SVSqKyQpsulqg"""
+
+urls_text = st.text_area(
+    "Liens iCal / webcal (un par ligne)",
+    value=default_urls,
+    height=140,
 )
 
-if not uploaded_files:
-    st.info("Charge plusieurs fichiers .ics pour afficher la vue agenda.")
+url_list = [line.strip() for line in urls_text.splitlines() if line.strip()]
+
+if not url_list:
+    st.info("Colle au moins un lien iCal ou webcal.")
     st.stop()
 
 dfs = []
 errors = []
 
-for file in uploaded_files:
-    try:
-        content = file.read()
-        df_file = parse_ics_file(file.name, content)
-        dfs.append(df_file)
-    except Exception as exc:
-        errors.append((file.name, str(exc)))
+with st.spinner("Téléchargement et analyse des agendas..."):
+    for idx, url in enumerate(url_list, start=1):
+        try:
+            raw_ics = download_ical_from_url(url)
+            calendar_name = extract_name_from_url(url, idx)
+            df_url = parse_ics_file(calendar_name, raw_ics)
+            dfs.append(df_url)
+        except Exception as exc:
+            errors.append((url, str(exc)))
 
 if errors:
-    st.warning("Certains fichiers n'ont pas pu être lus :")
-    for file_name, err in errors:
-        st.write(f"- {file_name}: {err}")
+    st.warning("Certains liens n'ont pas pu être lus :")
+    for link, err in errors:
+        st.write(f"- {link} : {err}")
 
 if not dfs:
-    st.error("Aucun calendrier exploitable.")
+    st.error("Aucun agenda exploitable.")
     st.stop()
 
 events_df = pd.concat(dfs, ignore_index=True)
 
 if events_df.empty:
-    st.warning("Aucun événement trouvé dans les fichiers fournis.")
+    st.warning("Aucun événement trouvé.")
     st.stop()
 
 events_df = enrich_local_columns(events_df, DISPLAY_TZ)
@@ -552,10 +621,6 @@ if not all_days:
     st.warning("Aucun jour disponible.")
     st.stop()
 
-
-# ============================================================
-# SIDEBAR
-# ============================================================
 st.sidebar.header("Filtres")
 
 selected_calendars = st.sidebar.multiselect(
@@ -574,17 +639,28 @@ date_range = st.sidebar.date_input(
     max_value=max_day,
 )
 
-show_only_conflicts = st.sidebar.checkbox("Afficher seulement les jours avec conflit", value=False)
+show_only_conflicts = st.sidebar.checkbox(
+    "Afficher seulement les jours avec conflit",
+    value=False,
+)
 
-start_hour = st.sidebar.slider("Heure de début visible", min_value=0, max_value=23, value=DAY_START_HOUR)
-end_hour = st.sidebar.slider("Heure de fin visible", min_value=1, max_value=24, value=DAY_END_HOUR)
+day_start_hour = st.sidebar.slider(
+    "Heure de début visible",
+    min_value=0,
+    max_value=23,
+    value=DEFAULT_DAY_START_HOUR,
+)
 
-if start_hour >= end_hour:
+day_end_hour = st.sidebar.slider(
+    "Heure de fin visible",
+    min_value=1,
+    max_value=24,
+    value=DEFAULT_DAY_END_HOUR,
+)
+
+if day_start_hour >= day_end_hour:
     st.sidebar.error("L'heure de début doit être inférieure à l'heure de fin.")
     st.stop()
-
-DAY_START_HOUR = start_hour
-DAY_END_HOUR = end_hour
 
 if isinstance(date_range, tuple) and len(date_range) == 2:
     selected_start_day, selected_end_day = date_range
@@ -613,20 +689,12 @@ if not days_to_show:
     st.success("Aucun jour avec conflit dans la période sélectionnée.")
     st.stop()
 
-
-# ============================================================
-# METRICS
-# ============================================================
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("Fichiers chargés", len(uploaded_files))
-col2.metric("Calendriers affichés", len(selected_calendars))
-col3.metric("Jours affichés", len(days_to_show))
+col1.metric("Agendas chargés", len(all_calendars))
+col2.metric("Agendas affichés", len(selected_calendars))
+col3.metric("Jours affichables", len(days_to_show))
 col4.metric("Événements visibles", len(filtered))
 
-
-# ============================================================
-# NAV JOUR
-# ============================================================
 selected_day = st.selectbox(
     "Jour à afficher",
     options=days_to_show,
@@ -636,16 +704,22 @@ selected_day = st.selectbox(
 day_df = filtered[filtered["day"] == selected_day].copy()
 
 st.markdown(f"## {format_day_fr(selected_day)}")
-st.caption("Chaque colonne correspond à un agenda différent.")
+st.caption("Une colonne = un agenda.")
 
-agenda_html = render_agenda_for_day(day_df, selected_calendars)
-st.components.v1.html(agenda_html, height=(DAY_END_HOUR - DAY_START_HOUR) * PIXELS_PER_HOUR + HEADER_HEIGHT + 30, scrolling=True)
+agenda_html = render_agenda_for_day(
+    day_df=day_df,
+    calendars=selected_calendars,
+    day_start_hour=day_start_hour,
+    day_end_hour=day_end_hour,
+)
 
+components.html(
+    agenda_html,
+    height=(day_end_hour - day_start_hour) * PIXELS_PER_HOUR + HEADER_HEIGHT + 30,
+    scrolling=True,
+)
 
-# ============================================================
-# DÉTAILS TEXTE
-# ============================================================
-with st.expander("Afficher aussi la liste détaillée des événements du jour"):
+with st.expander("Voir la liste détaillée des événements du jour"):
     display_df = day_df[
         [
             "calendar",
@@ -657,4 +731,5 @@ with st.expander("Afficher aussi la liste détaillée des événements du jour")
             "conflict_with",
         ]
     ].sort_values(["calendar", "segment_start_str", "segment_end_str", "title"])
+
     st.dataframe(display_df, use_container_width=True)
