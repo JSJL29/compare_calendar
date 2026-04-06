@@ -56,6 +56,29 @@ def format_day_fr(d: date) -> str:
     return f"{jours[d.weekday()]} {d.day} {mois[d.month]} {d.year}"
 
 
+def get_default_selected_day(days: List[date], tz_name: str = DISPLAY_TZ) -> date | None:
+    """
+    Choisit le jour par défaut :
+    - aujourd'hui si présent
+    - sinon la prochaine date disponible dans le futur
+    - sinon la dernière date disponible
+    """
+    if not days:
+        return None
+
+    today = pd.Timestamp.now(tz=tz_name).date()
+    sorted_days = sorted(days)
+
+    if today in sorted_days:
+        return today
+
+    future_days = [d for d in sorted_days if d > today]
+    if future_days:
+        return future_days[0]
+
+    return sorted_days[-1]
+
+
 # ============================================================
 # GESTION DES URL iCAL / WEBCAL
 # ============================================================
@@ -695,9 +718,13 @@ col2.metric("Agendas affichés", len(selected_calendars))
 col3.metric("Jours affichables", len(days_to_show))
 col4.metric("Événements visibles", len(filtered))
 
+default_day = get_default_selected_day(days_to_show, DISPLAY_TZ)
+default_index = days_to_show.index(default_day) if default_day in days_to_show else 0
+
 selected_day = st.selectbox(
     "Jour à afficher",
     options=days_to_show,
+    index=default_index,
     format_func=lambda d: format_day_fr(d),
 )
 
